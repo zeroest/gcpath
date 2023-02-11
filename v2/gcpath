@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+
+## usage: gcpath [eb | t | gc |  | h]
+## [trim   | t ]   # Trim path from log file           # Example: gcpath t raw.log [ paths.txt ]
+## [gc     |   ]   # Show paths that no longer in use  # Example: gcpath outbound 2023-01-01 [ paths.txt ]
+## [help   | h ]   # Help                              # Example: gcpath h
+
+__gcpath_main() {
+  case $1 in 
+    "trim"|"t")
+      __gcpath_trim $2 $3;;
+    "help"|"h")
+      __show_help;;
+    "gc")
+      shift 1;
+    *)
+      __gcpath_gc $1 $2 $3; exit ;;
+  esac
+}
+
+__gcpath_trim() {
+  __validate_file $1
+
+  echo "Trim $1"
+
+  result_file_name=$(__get_paths_file_name $2)
+
+  if [ -f "$result_file_name" ]
+  then
+    > "$result_file_name"
+  fi
+
+  awk '{ print substr($8,2,length($8)-3) }' $1 >> "$result_file_name"
+}
+
+__gcpath_gc() {
+  paths_file=$(__get_paths_file_name $3)
+  __validate_file $paths_file
+  __validate_service_name $1
+  __validate_from_date $2
+  __validate_es_base_url $GCPATH_ES_BASE_URL
+
+  echo "GC"
+  echo $GCPATH_ES_BASE_URL
+
+  from_date=$(__string_to_unixtime $2)
+
+  while read path
+  do
+
+    if [ -z "$path" ]
+    then
+      continue
+    fi
+
+    __call_es $1 $from_date $path
+    echo $?
+
+    # result=$( | jq -r '.aggregations.terms_aggs.buckets | .[] | .key')
+
+    if [ -z "$result" ]
+    then
+      echo $path
+    fi
+
+  done < $paths_file
+}
+
+__call_es() {
+  # echo $GCPATH_ES_BASE_URL
+  curl -s --location --request GET ''$GCPATH_ES_BASE_URL'/http_logs__*/_search' \
+  --header 'Content-Type: application/json' \
+  --data-raw '{
+      "query":{
+          "bool":{
+              "must":[
+                  {
+                      "term":{
+                          "serviceName":"'$1'"
+                      }
+                  },
+                  {
+                      "range":{
+                          "requestAt":{
+                              "gte":"'$2'"
+                          }
+                      }
+                  },
+                  {
+                    "match": {
+                      "originalUri.keyword": "'$3'"
+                    }
+                  }
+              ]
+          }
+      },
+      "aggs":{
+          "terms_aggs":{
+              "terms":{
+                  "field":"originalUri.keyword",
+                  "size":9999999
+              },
+              "aggs":{
+                  "stats_aggs":{
+                      "stats":{
+                          "field":"elapsedTime"
+                      }
+                  }
+              }
+          }
+      },
+      "size": 0
+  }'
+
+  # echo $result
+}
+
+__string_to_unixtime() {
+  echo "$(date -jf "%Y-%m-%d %H:%M:%S" "$1 00:00:00" +%s)000"
+}
+
+__validate_es_base_url() {
+  if [ -z $1 ]
+  then
+    echo "Please set es base url"
+    exit
+  fi
+
+  curl --location --request GET $1 > /dev/null 2>&1
+
+  if [ $? != 0 ]
+  then
+    echo "Invalid es base url"
+    exit
+  fi
+}
+
+__validate_file() {
+  if [ -z $1 ] || ! [ -f "$1" ]
+  then
+    echo "Please insert file name"
+    exit
+  fi
+}
+
+__validate_service_name() {
+  if [ -z $1 ]
+  then
+    echo "Please insert service name"
+    exit
+  fi
+}
+
+__validate_from_date() {
+  date -jf "%Y-%m-%d" $1 > /dev/null 2>&1
+
+  if [ $? == 1 ]
+  then
+    echo "Please insert from date (ex '2023-01-01')"
+    exit
+  fi
+}
+
+__get_paths_file_name() {
+  result_file_name="$1"
+
+  if [ -z "$result_file_name" ]
+  then
+    result_file_name="paths.txt"
+  fi
+
+  echo $result_file_name
+}
+
+__show_help() {
+    egrep '#{2} usage:' $BASH_SOURCE | sed 's/##//'
+    egrep '## \[' $BASH_SOURCE | column -ts'#'
+}
+
+__gcpath_main $@
