@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+
+## usage: gcpath [t | gc |  ]
+## [trim | t ]           # Trim path from log file                                           # Example: gcpath t raw.log
+## [gc   |   ]           # Show paths that no longer in use                                  # Example: gcpath gc servicename 2023-01-01
+##   options
+##   [-h   | --help   ]  # Show help                                                         # Example: gcpath -h
+##   [-p   | --profile]  # Set profile dev or prod (default prod)                            # Example: gcpath -p dev servicename 2023-01-01
+##   [-id  | --esid   ]  # Set elastic search auth username                                  # Example: gcpath -id esid -pw espw servicename 2023-01-01
+##   [-pw  | --espw   ]  # Set elastic search auth password                                  # Example: gcpath -id esid -pw espw servicename 2023-01-01
+##   [-in  | --input  ]  # Set input path that trimed endpoints file  (default ./paths.txt)  # Example: gcpath gc -in ./path/trimed_endpoints.txt servicename 2023-01-01
+##   [-out | --output ]  # Set output path that trimed endpoints file (default ./paths.txt)  # Example: gcpath t -out ./path/trimed_endpoints.txt ./raw.log
+
+ES_BASE_URL=$GCPATH_ES_BASE_URL_PROD
+ES_USERNAME=""
+ES_PASSWORD=""
+FILE_INPUT_PATH=""
+FILE_OUTPUT_PATH=""
+
+__gcpath_main() {
+  case $1 in 
+    help|h)
+      __show_help;;
+    trim|t)
+      shift 1
+      __gcpath_trim $@;;
+    gc)
+      shift 1
+      __gcpath_gc $@;;
+    *)
+      __gcpath_gc $@; exit ;;
+  esac
+}
+
+
+__gcpath_trim() {
+  __gcpath_gc_set_options $@
+  shift $?
+
+  __validate_file $1
+
+  echo "Trim $1"
+
+  result_file_name=$(__get_paths_file_name $FILE_OUTPUT_PATH)
+
+  if [ -f "$result_file_name" ]
+  then
+    > "$result_file_name"
+  fi
+
+  awk '{ print substr($8,2,length($8)-3) }' $1 >> "$result_file_name"
+}
+
+__gcpath_gc() {
+  __gcpath_gc_set_options $@
+  shift $?
+
+  __validate_service_name $1
+  __validate_from_date $2
+  paths_file=$(__get_paths_file_name $FILE_INPUT_PATH)
+  __validate_file $paths_file
+  __validate_es_base_url $ES_BASE_URL
+
+  echo "============================================================"
+  echo "ES base url: $ES_BASE_URL"
+  [[ -n "$ES_USERNAME" ]] && echo "ES username: $ES_USERNAME"
+  [[ -n "$ES_PASSWORD" ]] && echo "ES password: $ES_PASSWORD"
+  echo "============================================================"
+
+  from_date=$(__string_to_unixtime $2)
+
+  while read path
+  do
+
+    if [ -z "$path" ]
+    then
+      continue
+    fi
+
+
+    __call_es $1 $from_date $path
+    call_url=$(echo "$response" | jq -r '.aggregations.terms_aggs.buckets | .[0] | .key')
+    call_count=$(echo "$response" | jq -r '.aggregations.terms_aggs.buckets | .[0] | .doc_count')
+
+    if [ -z "$call_url" ] || [ "$call_url" == "null" ] || [ -z "$call_count" ] || [ "$call_count" == "null" ]
+    then
+      echo $path
+    fi
+
+  done < $paths_file
+
+  echo "============================================================"
+  exit 0
+}
+
+__call_es() {
+  response=$(curl -u $ES_USERNAME:$ES_PASSWORD -s --location --request GET $ES_BASE_URL'/wms_http_logs__*/_search' \
+  --header 'Content-Type: application/json' \
+  --data-raw '{
+      "query":{
+          "bool":{
+              "must":[
+                  {
+                      "term":{
+                          "serviceName":"'$1'"
+                      }
+                  },
+                  {
+                      "range":{
+                          "requestAt":{
+                              "gte":"'$2'"
+                          }
+                      }
+                  },
+                  {
+                    "match": {
+                      "originalUri.keyword": "'$3'"
+                    }
+                  }
+              ]
+          }
+      },
+      "aggs":{
+          "terms_aggs":{
+              "terms":{
+                  "field":"originalUri.keyword",
+                  "size":9999999
+              },
+              "aggs":{
+                  "stats_aggs":{
+                      "stats":{
+                          "field":"elapsedTime"
+                      }
+                  }
+              }
+          }
+      },
+      "size": 0
+  }')
+
+  echo "$response" | jq > /dev/null 2>&1
+
+  if [ $? != 0 ]
+  then
+    echo "[ES call error] $response" >&2
+    exit 1
+  fi
+}
+
+__gcpath_gc_set_options() {
+  shift_count=0
+
+  while (( "$#" )); do
+    case "$1" in
+      -p|--profile)
+        if [ -n "$2" ] && [ ${2:0:1} != "-" ];
+        then
+          if [ "$2" == "dev" ]
+          then
+            ES_BASE_URL=$GCPATH_ES_BASE_URL_DEV
+          elif [ "$2" == "prod" ]
+          then
+            ES_BASE_URL=$GCPATH_ES_BASE_URL_PROD
+          else
+            echo "[$1] Profile must dev or prod" >&2
+            exit 1
+          fi
+          shift 2
+          shift_count=$(($shift_count + 2))
+        else
+          echo "[$1] Profile is missing (dev, prod)" >&2
+          exit 1
+        fi
+        ;;
+      -id|--esid)
+        if [ -n "$2" ] && [ ${2:0:1} != "-" ];
+        then
+          ES_USERNAME=$2
+          shift 2
+          shift_count=$(($shift_count + 2))
+        else
+          echo "[$1] ES username is missing" >&2
+          exit 1
+        fi
+        ;;
+      -pw|--espw)
+        if [ -n "$2" ] && [ ${2:0:1} != "-" ];
+        then
+          ES_PASSWORD=$2
+          shift 2
+          shift_count=$(($shift_count + 2))
+        else
+          echo "[$1] ES password is missing" >&2
+          exit 1
+        fi
+        ;;
+      -in|--input)
+        if [ -n "$2" ] && [ ${2:0:1} != "-" ];
+        then
+          FILE_INPUT_PATH=$2
+          shift 2
+          shift_count=$(($shift_count + 2))
+        else
+          echo "[$1] Input file path is missing" >&2
+          exit 1
+        fi
+        ;;
+      -out|--output)
+        if [ -n "$2" ] && [ ${2:0:1} != "-" ];
+        then
+          FILE_OUTPUT_PATH=$2
+          shift 2
+          shift_count=$(($shift_count + 2))
+        else
+          echo "[$1] Output file path is missing" >&2
+          exit 1
+        fi
+        ;;
+      -h|--help)
+        __show_help
+        exit 0
+        ;;
+      -*|--*)
+        echo "[$1] Unsupported flag" >&2
+        exit 1
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  return $shift_count
+}
+
+### validate
+__validate_es_base_url() {
+  __validate_es_auth
+
+  if [ -z $1 ]
+  then
+    echo "Please set es base url" >&2
+    exit 1
+  fi
+
+  curl -u $ES_USERNAME:$ES_PASSWORD --location --request GET $1 > /dev/null 2>&1
+
+  if [ $? != 0 ]
+  then
+    echo "Invalid es base url" >&2
+    exit 1
+  fi
+}
+
+__validate_es_auth() {
+  if [ -z "$ES_USERNAME" ] && [ -z "$ES_PASSWORD" ]
+  then
+    return 0
+  fi
+
+  if [ -n "$ES_USERNAME" ] && [ -n "$ES_PASSWORD" ]
+  then
+    return 0
+  fi
+
+  echo "Not exist es username or password" >&2
+  exit 1
+}
+
+__validate_file() {
+  if [ -z $1 ] || ! [ -f "$1" ]
+  then
+    echo "Please insert file path" >&2
+    exit 1
+  fi
+}
+
+__validate_service_name() {
+  if [ -z $1 ]
+  then
+    echo "Please insert service name" >&2
+    exit 1
+  fi
+}
+
+__validate_from_date() {
+  date -jf "%Y-%m-%d" $1 > /dev/null 2>&1
+
+  if [ $? == 1 ]
+  then
+    echo "Please insert from date (ex '2023-01-01')" >&2
+    exit 1
+  fi
+}
+
+### util
+__string_to_unixtime() {
+  echo "$(date -jf "%Y-%m-%d %H:%M:%S" "$1 00:00:00" +%s)000"
+}
+
+__get_paths_file_name() {
+  result_file_name="$1"
+
+  if [ -z "$result_file_name" ]
+  then
+    result_file_name="paths.txt"
+  fi
+
+  echo $result_file_name
+}
+
+### help
+__show_help() {
+  egrep '#{2} usage:' $BASH_SOURCE | sed 's/##//'
+  egrep '## \[' $BASH_SOURCE | column -ts'#'
+  egrep '#{2}   options' $BASH_SOURCE | sed 's/##//'
+  egrep '##   \[' $BASH_SOURCE | column -ts'#'
+}
+
+### run
+__gcpath_main $@
