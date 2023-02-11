@@ -1,0 +1,47 @@
+#!/bin/bash
+
+if [ $1 == 'trim' ]
+then
+/bin/bash ./util/trim_path.sh $2 $3
+exit
+fi
+
+if [ -z $1 ] || ! [ -f "./$1" ]
+then
+  echo "Please insert path file"
+  exit
+fi
+
+if [ -z $2 ]
+then
+  echo "Please insert service name (ex job, metadata)"
+  exit
+fi
+
+if [ -z $3 ]
+then
+  echo "Please insert from date (ex '2023-01-01')"
+  exit
+fi
+
+
+while read path
+do
+
+  if [ -z "$path" ]
+  then
+    continue
+  fi
+
+  TARGET_DATE="$(date -jf "%Y-%m-%d %H:%M:%S" "$3 00:00:00" +%s)000"
+
+  RESULT=$(/bin/bash ./util/call_es.sh $2 $TARGET_DATE $path | jq -r '.aggregations.terms_aggs.buckets | .[] | .key')
+
+  if [ -z "$RESULT" ]
+  then
+    echo $path
+  fi
+
+done < $1
+
+
