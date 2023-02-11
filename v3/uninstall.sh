@@ -9,7 +9,7 @@ __main() {
     exit 1
   fi
 
-  rm $target_path
+  sudo rm $target_path
 
   echo "Uninstalled"
   exit 0
